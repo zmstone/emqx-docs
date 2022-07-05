@@ -1,4 +1,4 @@
-# Management APIs
+# HTTP APIs
 
 EMQX exposes a HTTP management API which by default listens on port 18083.
 The APIs are described by OpenAPI (Swagger) 3.0 specification.

@@ -15,6 +15,8 @@ THIS_DIR="$(cd "$(dirname "$(readlink "$0" || echo "$0")")"; pwd -P)"
 
 docker rm emqx-doc-preview > /dev/null 2>&1 || true
 
+./gen-api-spec/run.sh
+
 if [ "$PRODUCT" = "ce" ]; then
     python3 "$THIS_DIR/gen.py" ce > directory.json
     docker run -p ${PORT}:8080 -it --name emqx-doc-preview \

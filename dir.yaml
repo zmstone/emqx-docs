@@ -59,7 +59,10 @@
     - title_en: Command Line Interface
       title_cn: 命令行接口
       path: admin/cli
-    - admin/api # Swagger API doc
+    - admin/api # API overview
+    - title_en: HTTP API Spec
+      title_cn: API 规范
+      path: admin/api-spec # Swagger API spec
 
 - title_en: Security
   title_cn: 安全

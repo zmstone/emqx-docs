@@ -22,6 +22,7 @@ jobs:
 
     - name: check directory config
       run: |
+        ./gen-api-spec/run.sh
         python3 ./gen.py ce | tee directory.json
         python3 .github/scripts/directory_check.py directory.json $(pwd)
 

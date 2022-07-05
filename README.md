@@ -64,4 +64,3 @@ You can reach the EMQ community and developers via the following channels.
 - [Facebook](https://www.facebook.com/emqxmqtt)
 - [Reddit](https://www.reddit.com/r/emqx/)
 - [Blog](https://medium.com/@emqtt)
-
