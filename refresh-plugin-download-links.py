@@ -34,6 +34,10 @@ packages that do not exist yet. The generated URL goes live when the tag is
 published. Re-run the script without `--upcoming` after the release to
 regenerate the tables from real tags.
 
+Automation can use `--through-tag TAG` to include releases only through the
+GA that triggered a refresh. `--no-fetch` uses an already-fetched source clone
+without changing its tag snapshot.
+
 If an `en_US` catalog page does not yet exist for a discovered plugin,
 the script bootstraps it by copying the plugin's `README.md` from the
 latest stable tag of the series, then splices the Download table onto
@@ -49,7 +53,7 @@ Generated content is bounded by HTML-comment markers so the script is
 idempotent. If the markers are missing, a new Download section is
 appended at the end of the file. When the markers are already present,
 the script preserves the existing prose (heading, intro, column
-headers) and only appends data rows for release tags that are not yet
+headers), corrects outdated package rows, and appends release tags not yet
 listed — translator-polished wording in locales such as `ja_JP` is
 left intact instead of being overwritten by the `LOCALES` constants.
 """
@@ -174,13 +178,14 @@ def try_git(repo: Path, *args: str) -> str | None:
     return result.stdout
 
 
-def ensure_repo(supplied: Path | None, workdir: Path) -> Path:
+def ensure_repo(supplied: Path | None, workdir: Path, fetch: bool = True) -> Path:
     """Return a usable emqx repo; clone into workdir if none supplied."""
     if supplied is not None:
         if not (supplied / ".git").exists():
             sys.exit(f"error: {supplied} is not a git repository")
         print(f"Using existing emqx clone: {supplied}", file=sys.stderr)
-        run_git(supplied, "fetch", "--tags", "--quiet")
+        if fetch:
+            run_git(supplied, "fetch", "--tags", "--quiet")
         return supplied
 
     target = workdir / "emqx"
@@ -203,21 +208,12 @@ def list_release_tags(repo: Path, series: tuple[int, int]) -> list[ReleaseTag]:
     tags: list[ReleaseTag] = []
     for line in out.splitlines():
         raw = line.strip()
-        m = STABLE_TAG_RE.match(raw)
-        if not m:
+        try:
+            tag = parse_release_tag(raw)
+        except ValueError:
             continue
-        has_prefix = bool(m.group("prefix"))
-        major = int(m.group("major"))
-        minor = int(m.group("minor"))
-        patch = int(m.group("patch"))
-        if (major, minor) != (want_major, want_minor):
-            continue
-        # Enforce prefix convention: 5.x uses 'e', 6.x uses none.
-        if major == 5 and not has_prefix:
-            continue
-        if major >= 6 and has_prefix:
-            continue
-        tags.append(ReleaseTag(raw=raw, major=major, minor=minor, patch=patch))
+        if (tag.major, tag.minor) == (want_major, want_minor):
+            tags.append(tag)
     tags.sort(key=lambda t: t.sort_key)
     return tags
 
@@ -387,15 +383,32 @@ def splice_section(
 
     block_start = begin_idx + len(BEGIN_MARKER)
     existing_block = original[block_start:end_idx]
-    existing_versions = parse_existing_versions(existing_block)
+    wanted = {tag.display_version: (tag, pver) for tag, pver in entries}
+    lines = existing_block.split("\n")
+    for index, line in enumerate(lines):
+        match = DATA_ROW_RE.match(line)
+        if match is None or match.group("display_version") not in wanted:
+            continue
+        tag, pver = wanted[match.group("display_version")]
+        package = PACKAGE_URL_TEMPLATE.format(tag=tag.raw, plugin=plugin, plugin_ver=pver)
+        checksum = SHA256_URL_TEMPLATE.format(tag=tag.raw, plugin=plugin, plugin_ver=pver)
+        if (
+            line.split("|")[2].strip() != pver
+            or f"]({package})" not in line
+            or f"]({checksum})" not in line
+        ):
+            lines[index] = render_data_row(plugin, tag, pver)
+    updated_block = "\n".join(lines)
+    existing_versions = parse_existing_versions(updated_block)
     missing = [
         (tag, pver)
         for tag, pver in entries
         if tag.display_version not in existing_versions
     ]
-    if not missing:
+    if not missing and updated_block == existing_block:
         return original
-    updated_block = append_new_rows(existing_block, plugin, missing)
+    if missing:
+        updated_block = append_new_rows(updated_block, plugin, missing)
     return original[:block_start] + updated_block + original[end_idx:]
 
 
@@ -466,36 +479,32 @@ def resolve_series(flag: str | None, docs_root: Path) -> tuple[int, int]:
     return detected
 
 
-def parse_upcoming_flag(
-    flag: str, series: tuple[int, int]
-) -> ReleaseTag:
-    """Parse 'TAG[:REF]' into a ReleaseTag; validate against the series."""
-    tag_part, sep, ref_part = flag.partition(":")
-    git_ref = ref_part if sep else "HEAD"
-    m = STABLE_TAG_RE.match(tag_part)
-    if not m:
-        sys.exit(
-            f"error: --upcoming tag {tag_part!r} does not look like a "
-            f"stable release tag (e.g. '6.1.5' or 'e5.10.5')"
-        )
-    major = int(m.group("major"))
-    minor = int(m.group("minor"))
-    has_prefix = bool(m.group("prefix"))
-    if (major, minor) != series:
-        sys.exit(
-            f"error: --upcoming tag {tag_part!r} is not in the targeted "
-            f"series {series[0]}.{series[1]}"
-        )
-    if major == 5 and not has_prefix:
-        sys.exit(f"error: 5.x tags use the 'e' prefix (got {tag_part!r})")
-    if major >= 6 and has_prefix:
-        sys.exit(f"error: 6.x tags use no 'e' prefix (got {tag_part!r})")
+def parse_release_tag(raw: str) -> ReleaseTag:
+    """Parse a stable tag using the release line's prefix convention."""
+    match = STABLE_TAG_RE.fullmatch(raw)
+    if not match:
+        raise ValueError(f"not a stable release tag: {raw!r}")
+    major, minor, patch = (int(match.group(k)) for k in ("major", "minor", "patch"))
+    if bool(match.group("prefix")) != (major == 5):
+        raise ValueError(f"5.x tags use the e prefix; 6.x and later use none: {raw!r}")
+    return ReleaseTag(raw=raw, major=major, minor=minor, patch=patch)
+
+
+def parse_upcoming_flag(flag: str, series: tuple[int, int]) -> ReleaseTag:
+    """Parse an upcoming tag and its optional source ref."""
+    raw, separator, ref = flag.partition(":")
+    try:
+        tag = parse_release_tag(raw)
+    except ValueError as error:
+        sys.exit(f"error: --upcoming {error}")
+    if (tag.major, tag.minor) != series:
+        sys.exit(f"error: --upcoming tag {raw!r} is not in series {series[0]}.{series[1]}")
     return ReleaseTag(
-        raw=tag_part,
-        major=major,
-        minor=minor,
-        patch=int(m.group("patch")),
-        git_ref=git_ref,
+        raw=raw,
+        major=tag.major,
+        minor=tag.minor,
+        patch=tag.patch,
+        git_ref=ref if separator else "HEAD",
     )
 
 
@@ -525,7 +534,16 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parent,
         help="Root of emqx-docs (must contain en_US/zh_CN/ja_JP dirs). "
-             "Default: directory containing this script.",
+        "Default: directory containing this script.",
+    )
+    parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="Use the supplied EMQX tag snapshot without fetching again.",
+    )
+    parser.add_argument(
+        "--through-tag",
+        help="Include stable releases only through this existing tag.",
     )
     parser.add_argument(
         "--dry-run",
@@ -570,6 +588,18 @@ def main() -> int:
         )
 
     series = resolve_series(args.series, docs_root)
+    through = None
+    if args.through_tag:
+        if args.upcoming:
+            parser.error("--through-tag and --upcoming cannot be combined")
+        try:
+            through = parse_release_tag(args.through_tag)
+        except ValueError as error:
+            parser.error(str(error))
+        if (through.major, through.minor) != series:
+            parser.error("--through-tag must belong to the selected series")
+    if args.no_fetch and args.emqx_repo is None:
+        parser.error("--no-fetch requires --emqx-repo")
     upcoming = (
         parse_upcoming_flag(args.upcoming, series) if args.upcoming else None
     )
@@ -595,12 +625,18 @@ def main() -> int:
             workdir = Path(tmp_ctx.name)
         else:
             workdir = Path(".")
-        repo = ensure_repo(args.emqx_repo.resolve() if args.emqx_repo else None, workdir)
+        repo = ensure_repo(
+            args.emqx_repo.resolve() if args.emqx_repo else None, workdir, not args.no_fetch
+        )
 
         if upcoming is not None:
             validate_upcoming(repo, upcoming)
 
         tags = list_release_tags(repo, series)
+        if through is not None:
+            if through.raw not in {tag.raw for tag in tags}:
+                parser.error(f"--through-tag {through.raw!r} is not present in the source clone")
+            tags = [tag for tag in tags if tag.sort_key <= through.sort_key]
         if not tags and upcoming is None:
             print(
                 f"warning: no stable tags found for series {series[0]}.{series[1]}",
